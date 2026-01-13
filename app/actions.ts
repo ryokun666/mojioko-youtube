@@ -318,8 +318,10 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       // Vercel環境では getInfo を使用（字幕情報を含む）
       // getBasicInfo では字幕情報が取得できない場合がある
       let info;
+      let useGetInfo = false;
       try {
         info = await yt.getInfo(videoId);
+        useGetInfo = true;
         console.log(`[getTranscript] Info fetched with getInfo successfully`);
       } catch (error) {
         console.log(
@@ -348,22 +350,65 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
 
       // 字幕トラックを取得
       // getInfo と getBasicInfo で構造が異なる可能性があるため、両方に対応
-      // getInfo の場合は caption_tracks が直接含まれる可能性がある
       let captions = info.captions;
-      if (
-        !captions &&
-        info &&
-        typeof info === "object" &&
-        "caption_tracks" in info
-      ) {
-        const captionTracks = (info as { caption_tracks?: unknown })
-          .caption_tracks;
-        if (
-          captionTracks &&
-          Array.isArray(captionTracks) &&
-          captionTracks.length > 0
+
+      // getInfo を使用した場合、字幕情報が取得できない場合は別の方法を試す
+      if (!captions && useGetInfo) {
+        // getInfo の戻り値から字幕情報を取得する別の方法を試す
+        // VideoInfo オブジェクトには streaming_data や player_response が含まれる可能性がある
+        const infoAny = info as unknown as Record<string, unknown>;
+
+        // デバッグ: infoオブジェクトの構造を確認
+        console.log(`[getTranscript] Info keys:`, Object.keys(info));
+        console.log(`[getTranscript] Info.captions:`, info.captions);
+
+        // 様々な可能性のあるパスを試す
+        if (infoAny.caption_tracks) {
+          captions = {
+            caption_tracks: infoAny.caption_tracks,
+          } as typeof info.captions;
+        } else if (
+          infoAny.player_response &&
+          typeof infoAny.player_response === "object"
         ) {
-          captions = { caption_tracks: captionTracks } as typeof info.captions;
+          const playerResponse = infoAny.player_response as Record<
+            string,
+            unknown
+          >;
+          if (playerResponse.captions) {
+            captions = playerResponse.captions as typeof info.captions;
+          }
+        } else if (
+          infoAny.streaming_data &&
+          typeof infoAny.streaming_data === "object"
+        ) {
+          const streamingData = infoAny.streaming_data as Record<
+            string,
+            unknown
+          >;
+          if (streamingData.captions) {
+            captions = streamingData.captions as typeof info.captions;
+          }
+        }
+
+        // それでも取得できない場合は、getBasicInfo を試す
+        if (!captions) {
+          console.log(
+            `[getTranscript] Captions not found in getInfo, trying getBasicInfo as fallback`
+          );
+          try {
+            const basicInfo = await yt.getBasicInfo(videoId);
+            captions = basicInfo.captions;
+            console.log(
+              `[getTranscript] Captions from getBasicInfo:`,
+              captions ? "exists" : "null"
+            );
+          } catch (fallbackError) {
+            console.log(
+              `[getTranscript] getBasicInfo fallback failed:`,
+              fallbackError
+            );
+          }
         }
       }
 
@@ -371,6 +416,13 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
         `[getTranscript] Captions object:`,
         captions ? "exists" : "null"
       );
+
+      if (captions) {
+        console.log(`[getTranscript] Captions structure:`, {
+          hasCaptionTracks: !!captions.caption_tracks,
+          captionTracksLength: captions.caption_tracks?.length || 0,
+        });
+      }
 
       if (
         !captions ||
