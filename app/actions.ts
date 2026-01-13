@@ -314,11 +314,28 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
 
       const yt = await getInnertube();
       console.log(`[getTranscript] Fetching info for video: ${videoId}`);
-      const info = await yt.getBasicInfo(videoId);
-      console.log(`[getTranscript] Info fetched successfully`);
+
+      // Vercel環境では getInfo を使用（字幕情報を含む）
+      // getBasicInfo では字幕情報が取得できない場合がある
+      let info;
+      try {
+        info = await yt.getInfo(videoId);
+        console.log(`[getTranscript] Info fetched with getInfo successfully`);
+      } catch (error) {
+        console.log(
+          `[getTranscript] getInfo failed, trying getBasicInfo:`,
+          error
+        );
+        // getInfo が失敗した場合は getBasicInfo を試す
+        info = await yt.getBasicInfo(videoId);
+        console.log(
+          `[getTranscript] Info fetched with getBasicInfo successfully`
+        );
+      }
 
       // メタデータを取得
-      const basicInfo = info.basic_info;
+      // getInfo と getBasicInfo で構造が異なる可能性があるため、両方に対応
+      const basicInfo = info.basic_info || info;
       const metadata: VideoMetadata = {
         title: basicInfo.title || "タイトル不明",
         channelName:
@@ -330,7 +347,26 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       };
 
       // 字幕トラックを取得
-      const captions = info.captions;
+      // getInfo と getBasicInfo で構造が異なる可能性があるため、両方に対応
+      // getInfo の場合は caption_tracks が直接含まれる可能性がある
+      let captions = info.captions;
+      if (
+        !captions &&
+        info &&
+        typeof info === "object" &&
+        "caption_tracks" in info
+      ) {
+        const captionTracks = (info as { caption_tracks?: unknown })
+          .caption_tracks;
+        if (
+          captionTracks &&
+          Array.isArray(captionTracks) &&
+          captionTracks.length > 0
+        ) {
+          captions = { caption_tracks: captionTracks } as typeof info.captions;
+        }
+      }
+
       console.log(
         `[getTranscript] Captions object:`,
         captions ? "exists" : "null"
@@ -339,6 +375,7 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       if (
         !captions ||
         !captions.caption_tracks ||
+        !Array.isArray(captions.caption_tracks) ||
         captions.caption_tracks.length === 0
       ) {
         console.log(`[getTranscript] No caption tracks found`);
