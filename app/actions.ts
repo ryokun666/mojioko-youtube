@@ -28,6 +28,128 @@ interface CaptionTrack {
   is_translatable: boolean;
 }
 
+// YouTubeのHTML/JSONから直接字幕情報を取得する代替方法
+interface YouTubePlayerResponse {
+  videoDetails?: {
+    videoId: string;
+    title: string;
+    lengthSeconds: string;
+    channelId: string;
+    shortDescription: string;
+    thumbnail: {
+      thumbnails: Array<{ url: string; width: number; height: number }>;
+    };
+    author: string;
+  };
+  captions?: {
+    playerCaptionsTracklistRenderer?: {
+      captionTracks?: Array<{
+        baseUrl: string;
+        name: { simpleText: string };
+        vssId: string;
+        languageCode: string;
+        kind?: string;
+        isTranslatable: boolean;
+      }>;
+    };
+  };
+}
+
+// YouTubeのHTMLから直接字幕情報を取得（youtubei.jsのフォールバック）
+async function fetchCaptionsDirectly(videoId: string): Promise<{
+  captions: CaptionTrack[] | null;
+  metadata: VideoMetadata | null;
+}> {
+  console.log(`[fetchCaptionsDirectly] Fetching video page for: ${videoId}`);
+
+  try {
+    // YouTubeの動画ページをfetchで取得
+    const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      },
+    });
+
+    if (!response.ok) {
+      console.error(
+        `[fetchCaptionsDirectly] Failed to fetch: ${response.status}`
+      );
+      return { captions: null, metadata: null };
+    }
+
+    const html = await response.text();
+    console.log(`[fetchCaptionsDirectly] HTML fetched, length: ${html.length}`);
+
+    // ytInitialPlayerResponse を抽出
+    const playerResponseMatch = html.match(
+      /var ytInitialPlayerResponse\s*=\s*({.+?});(?:<\/script>|\s*var\s)/
+    );
+
+    if (!playerResponseMatch) {
+      console.error(
+        "[fetchCaptionsDirectly] ytInitialPlayerResponse not found"
+      );
+      return { captions: null, metadata: null };
+    }
+
+    let playerResponse: YouTubePlayerResponse;
+    try {
+      playerResponse = JSON.parse(playerResponseMatch[1]);
+      console.log("[fetchCaptionsDirectly] Player response parsed");
+    } catch (e) {
+      console.error(
+        "[fetchCaptionsDirectly] Failed to parse player response:",
+        e
+      );
+      return { captions: null, metadata: null };
+    }
+
+    // メタデータを抽出
+    const videoDetails = playerResponse.videoDetails;
+    const metadata: VideoMetadata | null = videoDetails
+      ? {
+          title: videoDetails.title || "タイトル不明",
+          channelName: videoDetails.author || "チャンネル不明",
+          description: videoDetails.shortDescription || "",
+          thumbnail:
+            videoDetails.thumbnail?.thumbnails?.[0]?.url ||
+            `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        }
+      : null;
+
+    // 字幕トラックを抽出
+    const captionTracks =
+      playerResponse.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+    if (!captionTracks || captionTracks.length === 0) {
+      console.log("[fetchCaptionsDirectly] No caption tracks found");
+      return { captions: null, metadata };
+    }
+
+    // CaptionTrack 形式に変換
+    const captions: CaptionTrack[] = captionTracks.map((track) => ({
+      base_url: track.baseUrl,
+      name: { text: track.name?.simpleText || "", rtl: false },
+      vss_id: track.vssId,
+      language_code: track.languageCode,
+      kind: track.kind,
+      is_translatable: track.isTranslatable,
+    }));
+
+    console.log(
+      `[fetchCaptionsDirectly] Found ${captions.length} caption tracks`
+    );
+    return { captions, metadata };
+  } catch (error) {
+    console.error("[fetchCaptionsDirectly] Error:", error);
+    return { captions: null, metadata: null };
+  }
+}
+
 // Innertubeインスタンスをキャッシュ
 let innertubeInstance: Innertube | null = null;
 let initializationPromise: Promise<Innertube> | null = null;
@@ -497,22 +619,43 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
         });
       }
 
+      // youtubei.js で字幕が取得できない場合、直接HTMLから取得する（Vercel環境向けフォールバック）
+      let captionTracks: CaptionTrack[] = [];
+      let finalMetadata = metadata;
+
       if (
         !captions ||
         !captions.caption_tracks ||
         !Array.isArray(captions.caption_tracks) ||
         captions.caption_tracks.length === 0
       ) {
-        console.log(`[getTranscript] No caption tracks found`);
-        return {
-          success: false,
-          error: "この動画には字幕がありません",
-          metadata,
-        };
-      }
+        console.log(
+          `[getTranscript] No caption tracks from youtubei.js, trying direct HTML fetch`
+        );
 
-      const captionTracks =
-        captions.caption_tracks as unknown as CaptionTrack[];
+        // 直接HTMLから字幕情報を取得
+        const directResult = await fetchCaptionsDirectly(videoId);
+
+        if (directResult.captions && directResult.captions.length > 0) {
+          console.log(
+            `[getTranscript] Direct HTML fetch successful: ${directResult.captions.length} tracks`
+          );
+          captionTracks = directResult.captions;
+          // メタデータも更新（より詳細な情報が取得できた場合）
+          if (directResult.metadata) {
+            finalMetadata = directResult.metadata;
+          }
+        } else {
+          console.log(`[getTranscript] Direct HTML fetch also failed`);
+          return {
+            success: false,
+            error: "この動画には字幕がありません",
+            metadata: directResult.metadata || finalMetadata,
+          };
+        }
+      } else {
+        captionTracks = captions.caption_tracks as unknown as CaptionTrack[];
+      }
       console.log(
         `[getTranscript] Found ${captionTracks.length} caption tracks`
       );
@@ -541,7 +684,7 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
         return {
           success: false,
           error: "この動画には字幕がありません",
-          metadata,
+          metadata: finalMetadata,
         };
       }
 
@@ -556,7 +699,7 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
         return {
           success: false,
           error: "字幕テキストの抽出に失敗しました",
-          metadata,
+          metadata: finalMetadata,
         };
       }
 
@@ -570,7 +713,7 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
         success: true,
         transcript: fullTranscript,
         language,
-        metadata,
+        metadata: finalMetadata,
       };
     } catch (error) {
       console.error(
