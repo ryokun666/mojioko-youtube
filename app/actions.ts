@@ -46,12 +46,17 @@ async function getInnertube(): Promise<Innertube> {
   // 初期化を開始
   initializationPromise = (async () => {
     try {
+      console.log("[Innertube] Initializing...");
       const instance = await Innertube.create({
         generate_session_locally: true,
+        // Vercel環境での互換性を向上
+        retrieve_player: true,
       });
+      console.log("[Innertube] Initialized successfully");
       innertubeInstance = instance;
       return instance;
     } catch (error) {
+      console.error("[Innertube] Initialization failed:", error);
       // エラーが発生した場合は、次回再試行できるようにクリア
       initializationPromise = null;
       throw error;
@@ -74,10 +79,25 @@ async function fetchTranscriptFromUrl(
 ): Promise<Array<{ text: string; startMs: number; durationMs: number }>> {
   // JSON形式で取得（fmt=json3）
   const jsonUrl = url + "&fmt=json3";
-  const response = await fetch(jsonUrl);
+  console.log(
+    `[fetchTranscriptFromUrl] Fetching from: ${jsonUrl.substring(0, 100)}...`
+  );
+
+  const response = await fetch(jsonUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "application/json",
+    },
+  });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch transcript: ${response.status}`);
+    console.error(
+      `[fetchTranscriptFromUrl] Failed: ${response.status} ${response.statusText}`
+    );
+    throw new Error(
+      `Failed to fetch transcript: ${response.status} ${response.statusText}`
+    );
   }
 
   const data = await response.json();
@@ -293,7 +313,9 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       }
 
       const yt = await getInnertube();
+      console.log(`[getTranscript] Fetching info for video: ${videoId}`);
       const info = await yt.getBasicInfo(videoId);
+      console.log(`[getTranscript] Info fetched successfully`);
 
       // メタデータを取得
       const basicInfo = info.basic_info;
@@ -341,7 +363,11 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       }
 
       // 字幕URLからテキストを取得（タイムスタンプ情報も含む）
+      console.log(`[getTranscript] Fetching transcript from URL`);
       const segments = await fetchTranscriptFromUrl(selectedTrack.base_url);
+      console.log(
+        `[getTranscript] Transcript fetched: ${segments.length} segments`
+      );
 
       if (segments.length === 0) {
         return {
