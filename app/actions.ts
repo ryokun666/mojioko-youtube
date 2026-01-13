@@ -331,12 +331,17 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
 
       // 字幕トラックを取得
       const captions = info.captions;
+      console.log(
+        `[getTranscript] Captions object:`,
+        captions ? "exists" : "null"
+      );
 
       if (
         !captions ||
         !captions.caption_tracks ||
         captions.caption_tracks.length === 0
       ) {
+        console.log(`[getTranscript] No caption tracks found`);
         return {
           success: false,
           error: "この動画には字幕がありません",
@@ -346,6 +351,9 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
 
       const captionTracks =
         captions.caption_tracks as unknown as CaptionTrack[];
+      console.log(
+        `[getTranscript] Found ${captionTracks.length} caption tracks`
+      );
 
       // 日本語 → 英語 → その他の順で字幕を選択
       const preferredLanguages = ["ja", "en"];
@@ -353,8 +361,21 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
         captionTracks,
         preferredLanguages
       );
+      console.log(
+        `[getTranscript] Selected track:`,
+        selectedTrack
+          ? {
+              language: selectedTrack.language_code,
+              name: selectedTrack.name.text,
+              hasBaseUrl: !!selectedTrack.base_url,
+            }
+          : "null"
+      );
 
       if (!selectedTrack || !selectedTrack.base_url) {
+        console.log(
+          `[getTranscript] No valid track selected or missing base_url`
+        );
         return {
           success: false,
           error: "この動画には字幕がありません",
