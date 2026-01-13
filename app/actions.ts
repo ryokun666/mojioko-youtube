@@ -47,16 +47,48 @@ async function getInnertube(): Promise<Innertube> {
   initializationPromise = (async () => {
     try {
       console.log("[Innertube] Initializing...");
+      // Vercel環境を検出
+      const isVercel = process.env.VERCEL === "1" || process.env.VERCEL_ENV;
+      console.log(`[Innertube] Environment: ${isVercel ? "Vercel" : "Local"}`);
+
       const instance = await Innertube.create({
-        generate_session_locally: true,
+        // Vercel環境では generate_session_locally を false にしてみる
+        generate_session_locally: !isVercel,
         // Vercel環境での互換性を向上
         retrieve_player: true,
+        // Vercelのサーバーレス環境は読み取り専用ファイルシステムのため、キャッシュを無効化
+        enable_session_cache: false,
       });
       console.log("[Innertube] Initialized successfully");
       innertubeInstance = instance;
       return instance;
     } catch (error) {
       console.error("[Innertube] Initialization failed:", error);
+
+      // ファイルシステムエラー（読み取り専用）の検出
+      if (error instanceof Error) {
+        if (
+          error.message.includes("EROFS") ||
+          error.message.includes("read-only") ||
+          error.message.includes("EACCES") ||
+          error.message.includes("ENOENT")
+        ) {
+          console.error(
+            "[Innertube] File system error detected. This might be a Vercel read-only filesystem issue."
+          );
+        }
+        // 403エラー（IPブロック）の検出
+        if (
+          error.message.includes("403") ||
+          error.message.includes("Forbidden") ||
+          error.message.includes("Sign in to confirm")
+        ) {
+          console.error(
+            "[Innertube] 403 Forbidden detected. This might be YouTube IP blocking."
+          );
+        }
+      }
+
       // エラーが発生した場合は、次回再試行できるようにクリア
       initializationPromise = null;
       throw error;
@@ -351,6 +383,44 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       // 字幕トラックを取得
       let captions = info.captions;
 
+      // デバッグ: captions の詳細を確認
+      console.log(`[getTranscript] Captions check:`, {
+        captionsExists: !!captions,
+        captionsType: typeof captions,
+        captionsValue: captions,
+        infoKeys: Object.keys(info),
+        hasBasicInfo: !!info.basic_info,
+      });
+
+      // Vercel環境では、getBasicInfo でも captions が null になる問題がある
+      // infoオブジェクトの全構造をログに出力して確認
+      if (!captions) {
+        console.log(
+          `[getTranscript] Captions is null, checking info structure`
+        );
+        if (info.basic_info) {
+          console.log(
+            `[getTranscript] basic_info keys:`,
+            Object.keys(info.basic_info)
+          );
+        }
+        // infoオブジェクト全体をJSON化して確認（循環参照を避けるため、一部のみ）
+        try {
+          const infoSnapshot = {
+            hasCaptions: "captions" in info,
+            captionsType: typeof (info as unknown as { captions?: unknown })
+              .captions,
+            basicInfoKeys: info.basic_info ? Object.keys(info.basic_info) : [],
+          };
+          console.log(
+            `[getTranscript] Info snapshot:`,
+            JSON.stringify(infoSnapshot, null, 2)
+          );
+        } catch (e) {
+          console.log(`[getTranscript] Failed to serialize info:`, e);
+        }
+      }
+
       // getInfo を使用した場合、captions プロパティに直接アクセスできない可能性がある
       // Object.keys には 'captions' が含まれているが、info.captions が undefined になる問題
       if (!captions && useGetInfo) {
@@ -521,6 +591,32 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
   console.error("Transcript fetch error (all retries failed):", error);
 
   if (error instanceof Error) {
+    // ファイルシステムエラー（Vercelの読み取り専用ファイルシステム）
+    if (
+      error.message.includes("EROFS") ||
+      error.message.includes("read-only") ||
+      error.message.includes("EACCES") ||
+      error.message.includes("ENOENT")
+    ) {
+      return {
+        success: false,
+        error:
+          "ファイルシステムエラーが発生しました。キャッシュ設定を確認してください。",
+      };
+    }
+    // 403エラー（YouTubeによるIPブロック）
+    if (
+      error.message.includes("403") ||
+      error.message.includes("Forbidden") ||
+      error.message.includes("Sign in to confirm") ||
+      error.message.includes("bot")
+    ) {
+      return {
+        success: false,
+        error:
+          "YouTubeによるアクセス制限が発生しました。しばらくしてからお試しください。",
+      };
+    }
     // タイムアウトエラー
     if (
       error.message.includes("timeout") ||
