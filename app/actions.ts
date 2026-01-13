@@ -30,14 +30,35 @@ interface CaptionTrack {
 
 // Innertubeインスタンスをキャッシュ
 let innertubeInstance: Innertube | null = null;
+let initializationPromise: Promise<Innertube> | null = null;
 
 async function getInnertube(): Promise<Innertube> {
-  if (!innertubeInstance) {
-    innertubeInstance = await Innertube.create({
-      generate_session_locally: true,
-    });
+  // 既にインスタンスがある場合はそれを返す
+  if (innertubeInstance) {
+    return innertubeInstance;
   }
-  return innertubeInstance;
+
+  // 初期化中の場合は、そのPromiseを返す（重複初期化を防ぐ）
+  if (initializationPromise) {
+    return initializationPromise;
+  }
+
+  // 初期化を開始
+  initializationPromise = (async () => {
+    try {
+      const instance = await Innertube.create({
+        generate_session_locally: true,
+      });
+      innertubeInstance = instance;
+      return instance;
+    } catch (error) {
+      // エラーが発生した場合は、次回再試行できるようにクリア
+      initializationPromise = null;
+      throw error;
+    }
+  })();
+
+  return initializationPromise;
 }
 
 // 字幕イベントの型
@@ -257,108 +278,169 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
     };
   }
 
-  try {
-    const yt = await getInnertube();
-    const info = await yt.getBasicInfo(videoId);
+  // リトライロジック（最大2回まで）
+  const maxRetries = 2;
+  let lastError: Error | null = null;
 
-    // メタデータを取得
-    const basicInfo = info.basic_info;
-    const metadata: VideoMetadata = {
-      title: basicInfo.title || "タイトル不明",
-      channelName: basicInfo.channel?.name || basicInfo.author || "チャンネル不明",
-      description: basicInfo.short_description || "",
-      thumbnail:
-        basicInfo.thumbnail?.[0]?.url ||
-        `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    };
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      // リトライ時はインスタンスを再初期化
+      if (attempt > 0) {
+        innertubeInstance = null;
+        initializationPromise = null;
+        // 少し待ってから再試行
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      }
 
-    // 字幕トラックを取得
-    const captions = info.captions;
+      const yt = await getInnertube();
+      const info = await yt.getBasicInfo(videoId);
 
+      // メタデータを取得
+      const basicInfo = info.basic_info;
+      const metadata: VideoMetadata = {
+        title: basicInfo.title || "タイトル不明",
+        channelName:
+          basicInfo.channel?.name || basicInfo.author || "チャンネル不明",
+        description: basicInfo.short_description || "",
+        thumbnail:
+          basicInfo.thumbnail?.[0]?.url ||
+          `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      };
+
+      // 字幕トラックを取得
+      const captions = info.captions;
+
+      if (
+        !captions ||
+        !captions.caption_tracks ||
+        captions.caption_tracks.length === 0
+      ) {
+        return {
+          success: false,
+          error: "この動画には字幕がありません",
+          metadata,
+        };
+      }
+
+      const captionTracks =
+        captions.caption_tracks as unknown as CaptionTrack[];
+
+      // 日本語 → 英語 → その他の順で字幕を選択
+      const preferredLanguages = ["ja", "en"];
+      const selectedTrack = selectBestCaptionTrack(
+        captionTracks,
+        preferredLanguages
+      );
+
+      if (!selectedTrack || !selectedTrack.base_url) {
+        return {
+          success: false,
+          error: "この動画には字幕がありません",
+          metadata,
+        };
+      }
+
+      // 字幕URLからテキストを取得（タイムスタンプ情報も含む）
+      const segments = await fetchTranscriptFromUrl(selectedTrack.base_url);
+
+      if (segments.length === 0) {
+        return {
+          success: false,
+          error: "字幕テキストの抽出に失敗しました",
+          metadata,
+        };
+      }
+
+      // テキストを読みやすく整形（改行を追加）
+      const fullTranscript = formatTranscript(segments);
+
+      // 言語名を日本語に変換
+      const language = translateLanguageName(selectedTrack.name.text);
+
+      return {
+        success: true,
+        transcript: fullTranscript,
+        language,
+        metadata,
+      };
+    } catch (error) {
+      console.error(
+        `Transcript fetch error (attempt ${attempt + 1}/${maxRetries + 1}):`,
+        error
+      );
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      // 最後の試行でない場合、リトライ
+      if (attempt < maxRetries) {
+        continue;
+      }
+    }
+  }
+
+  // すべてのリトライが失敗した場合
+  const error = lastError || new Error("Unknown error");
+  console.error("Transcript fetch error (all retries failed):", error);
+
+  if (error instanceof Error) {
+    // タイムアウトエラー
     if (
-      !captions ||
-      !captions.caption_tracks ||
-      captions.caption_tracks.length === 0
+      error.message.includes("timeout") ||
+      error.message.includes("Timeout") ||
+      error.message.includes("TIMEOUT") ||
+      error.name === "TimeoutError"
     ) {
       return {
         success: false,
-        error: "この動画には字幕がありません",
-        metadata,
+        error:
+          "タイムアウトが発生しました。動画が長い場合、時間がかかることがあります。しばらくしてからお試しください。",
       };
     }
-
-    const captionTracks = captions.caption_tracks as unknown as CaptionTrack[];
-
-    // 日本語 → 英語 → その他の順で字幕を選択
-    const preferredLanguages = ["ja", "en"];
-    const selectedTrack = selectBestCaptionTrack(
-      captionTracks,
-      preferredLanguages
-    );
-
-    if (!selectedTrack || !selectedTrack.base_url) {
+    // ネットワークエラー
+    if (
+      error.message.includes("fetch") ||
+      error.message.includes("network") ||
+      error.message.includes("ECONNREFUSED") ||
+      error.message.includes("ENOTFOUND")
+    ) {
       return {
         success: false,
-        error: "この動画には字幕がありません",
-        metadata,
+        error:
+          "ネットワークエラーが発生しました。インターネット接続を確認してください。",
       };
     }
-
-    // 字幕URLからテキストを取得（タイムスタンプ情報も含む）
-    const segments = await fetchTranscriptFromUrl(selectedTrack.base_url);
-
-    if (segments.length === 0) {
+    // 字幕が無効な場合
+    if (
+      error.message.includes("Transcript") ||
+      error.message.includes("transcript") ||
+      error.message.includes("caption")
+    ) {
       return {
         success: false,
-        error: "字幕テキストの抽出に失敗しました",
-        metadata,
+        error:
+          "この動画には字幕がありません。字幕が有効な動画を試してください。",
       };
     }
-
-    // テキストを読みやすく整形（改行を追加）
-    const fullTranscript = formatTranscript(segments);
-
-    // 言語名を日本語に変換
-    const language = translateLanguageName(selectedTrack.name.text);
-
-    return {
-      success: true,
-      transcript: fullTranscript,
-      language,
-      metadata,
-    };
-  } catch (error) {
-    console.error("Transcript fetch error:", error);
-
-    if (error instanceof Error) {
-      // 字幕が無効な場合
-      if (
-        error.message.includes("Transcript") ||
-        error.message.includes("transcript") ||
-        error.message.includes("caption")
-      ) {
-        return {
-          success: false,
-          error:
-            "この動画には字幕がありません。字幕が有効な動画を試してください。",
-        };
-      }
-      // 動画が利用不可
-      if (
-        error.message.includes("unavailable") ||
-        error.message.includes("Video")
-      ) {
-        return {
-          success: false,
-          error: "この動画は利用できません",
-        };
-      }
+    // 動画が利用不可
+    if (
+      error.message.includes("unavailable") ||
+      error.message.includes("Video") ||
+      error.message.includes("not found")
+    ) {
+      return {
+        success: false,
+        error: "この動画は利用できません",
+      };
     }
-
+    // その他のエラー（詳細を返す）
     return {
       success: false,
-      error:
-        "字幕の取得中にエラーが発生しました。しばらくしてからお試しください。",
+      error: `エラーが発生しました: ${error.message}`,
     };
   }
+
+  return {
+    success: false,
+    error:
+      "字幕の取得中にエラーが発生しました。しばらくしてからお試しください。",
+  };
 }

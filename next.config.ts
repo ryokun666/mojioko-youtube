@@ -17,6 +17,12 @@ const nextConfig: NextConfig = {
       },
     ],
   },
+  // VercelのServerless Functionsのタイムアウトを延長（最大60秒）
+  experimental: {
+    serverActions: {
+      bodySizeLimit: "2mb",
+    },
+  },
 };
 
 export default nextConfig;
