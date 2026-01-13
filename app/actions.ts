@@ -315,24 +315,24 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       const yt = await getInnertube();
       console.log(`[getTranscript] Fetching info for video: ${videoId}`);
 
-      // Vercel環境では getInfo を使用（字幕情報を含む）
-      // getBasicInfo では字幕情報が取得できない場合がある
+      // ローカルでは getBasicInfo が動作するため、まず getBasicInfo を試す
+      // Vercel環境では getInfo の captions プロパティにアクセスできない問題がある
       let info;
       let useGetInfo = false;
       try {
-        info = await yt.getInfo(videoId);
-        useGetInfo = true;
-        console.log(`[getTranscript] Info fetched with getInfo successfully`);
-      } catch (error) {
-        console.log(
-          `[getTranscript] getInfo failed, trying getBasicInfo:`,
-          error
-        );
-        // getInfo が失敗した場合は getBasicInfo を試す
         info = await yt.getBasicInfo(videoId);
         console.log(
           `[getTranscript] Info fetched with getBasicInfo successfully`
         );
+      } catch (error) {
+        console.log(
+          `[getTranscript] getBasicInfo failed, trying getInfo:`,
+          error
+        );
+        // getBasicInfo が失敗した場合は getInfo を試す
+        info = await yt.getInfo(videoId);
+        useGetInfo = true;
+        console.log(`[getTranscript] Info fetched with getInfo successfully`);
       }
 
       // メタデータを取得
@@ -349,63 +349,66 @@ export async function getTranscript(url: string): Promise<TranscriptResult> {
       };
 
       // 字幕トラックを取得
-      // getInfo と getBasicInfo で構造が異なる可能性があるため、両方に対応
       let captions = info.captions;
 
-      // getInfo を使用した場合、字幕情報が取得できない場合は別の方法を試す
+      // getInfo を使用した場合、captions プロパティに直接アクセスできない可能性がある
+      // Object.keys には 'captions' が含まれているが、info.captions が undefined になる問題
       if (!captions && useGetInfo) {
-        // getInfo の戻り値から字幕情報を取得する別の方法を試す
-        // VideoInfo オブジェクトには streaming_data や player_response が含まれる可能性がある
+        console.log(
+          `[getTranscript] Captions not accessible via info.captions, trying alternative access methods`
+        );
+
+        // プロキシやゲッター経由でアクセスできない場合、別の方法を試す
         const infoAny = info as unknown as Record<string, unknown>;
 
-        // デバッグ: infoオブジェクトの構造を確認
-        console.log(`[getTranscript] Info keys:`, Object.keys(info));
-        console.log(`[getTranscript] Info.captions:`, info.captions);
+        // 1. ブラケット記法でアクセス
+        if (infoAny["captions"]) {
+          captions = infoAny["captions"] as typeof info.captions;
+          console.log(`[getTranscript] Captions found via bracket notation`);
+        }
 
-        // 様々な可能性のあるパスを試す
-        if (infoAny.caption_tracks) {
-          captions = {
-            caption_tracks: infoAny.caption_tracks,
-          } as typeof info.captions;
-        } else if (
-          infoAny.player_response &&
-          typeof infoAny.player_response === "object"
-        ) {
-          const playerResponse = infoAny.player_response as Record<
-            string,
-            unknown
-          >;
-          if (playerResponse.captions) {
-            captions = playerResponse.captions as typeof info.captions;
-          }
-        } else if (
-          infoAny.streaming_data &&
-          typeof infoAny.streaming_data === "object"
-        ) {
-          const streamingData = infoAny.streaming_data as Record<
-            string,
-            unknown
-          >;
-          if (streamingData.captions) {
-            captions = streamingData.captions as typeof info.captions;
+        // 2. Reflect.get でアクセス
+        if (!captions && typeof Reflect !== "undefined") {
+          const captionsValue = Reflect.get(info, "captions");
+          if (captionsValue) {
+            captions = captionsValue as typeof info.captions;
+            console.log(`[getTranscript] Captions found via Reflect.get`);
           }
         }
 
-        // それでも取得できない場合は、getBasicInfo を試す
+        // 3. Object.getOwnPropertyDescriptor で確認
+        if (!captions) {
+          const descriptor = Object.getOwnPropertyDescriptor(info, "captions");
+          if (descriptor && descriptor.get) {
+            try {
+              captions = descriptor.get.call(info) as typeof info.captions;
+              console.log(
+                `[getTranscript] Captions found via property descriptor getter`
+              );
+            } catch (e) {
+              console.log(
+                `[getTranscript] Failed to get captions via descriptor:`,
+                e
+              );
+            }
+          }
+        }
+
+        // それでも取得できない場合は、getBasicInfo を再試行
         if (!captions) {
           console.log(
-            `[getTranscript] Captions not found in getInfo, trying getBasicInfo as fallback`
+            `[getTranscript] All access methods failed, retrying getBasicInfo`
           );
           try {
             const basicInfo = await yt.getBasicInfo(videoId);
             captions = basicInfo.captions;
             console.log(
-              `[getTranscript] Captions from getBasicInfo:`,
+              `[getTranscript] Captions from getBasicInfo retry:`,
               captions ? "exists" : "null"
             );
           } catch (fallbackError) {
             console.log(
-              `[getTranscript] getBasicInfo fallback failed:`,
+              `[getTranscript] getBasicInfo retry failed:`,
               fallbackError
             );
           }
